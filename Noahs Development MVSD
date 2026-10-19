@@ -1,0 +1,1067 @@
+-- lang: Luau | target: Roblox Executor
+-- Noah Developments — hx_suite_v2.lua
+-- Single-tab layout: ESP + Silent Aim + Ragebot
+-- Config system: create / rename / delete / autoload
+
+--[[
+    LAYOUT
+    1. Services & refs
+    2. Config
+    3. Config persistence (save/load/autoload)
+    4. UI — Noah Developments glass panel, single scrolling tab
+    5. ESP — chams only
+    6. Silent Aim — WeaponRaycast hook
+    7. Ragebot — Heartbeat ShootGun fire
+    8. Keybind listener
+]]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 1. SERVICES
+-- ─────────────────────────────────────────────────────────────────────────────
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+local CoreGui           = game:GetService("CoreGui")
+local StarterGui        = game:GetService("StarterGui")
+local HttpService       = game:GetService("HttpService")
+
+local LP     = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 2. CONFIG
+-- ─────────────────────────────────────────────────────────────────────────────
+local Cfg = {
+    ESPEnabled = false,
+    SAEnabled  = false,
+    RBEnabled  = false,
+
+    Keys = {
+        ToggleMenu = Enum.KeyCode.RightShift,
+        ToggleESP  = Enum.KeyCode.F,
+        ToggleSA   = Enum.KeyCode.V,
+        ToggleRB   = Enum.KeyCode.R,
+    },
+
+    ChamsFill      = Color3.fromRGB(220, 40, 40),
+    ChamsOutline   = Color3.fromRGB(255, 255, 255),
+    ChamsFillAlpha = 0.40,
+    ChamsOutAlpha  = 0.20,
+    MaxDistESP     = 2000,
+
+    MaxDistSA      = 500,
+    SAHitOffset    = Vector3.new(0, 0, 0),
+    SARandomWeight = 0.6,
+
+    MaxDistRB      = 500,
+    RBCooldown     = 0.11,
+    RBTargetPart   = "Head",
+}
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 3. CONFIG PERSISTENCE
+-- ─────────────────────────────────────────────────────────────────────────────
+local CONFIG_DIR    = "nd_configs"
+local AUTOLOAD_FILE = CONFIG_DIR .. "/autoload.txt"
+
+local function EnsureDir()
+    if not isfolder(CONFIG_DIR) then makefolder(CONFIG_DIR) end
+end
+
+local function SerializeCfg()
+    return HttpService:JSONEncode({
+        ESPEnabled     = Cfg.ESPEnabled,
+        SAEnabled      = Cfg.SAEnabled,
+        RBEnabled      = Cfg.RBEnabled,
+        MaxDistESP     = Cfg.MaxDistESP,
+        MaxDistSA      = Cfg.MaxDistSA,
+        SARandomWeight = Cfg.SARandomWeight,
+        MaxDistRB      = Cfg.MaxDistRB,
+        RBCooldown     = Cfg.RBCooldown,
+        RBTargetPart   = Cfg.RBTargetPart,
+        Keys = {
+            ToggleMenu = tostring(Cfg.Keys.ToggleMenu),
+            ToggleESP  = tostring(Cfg.Keys.ToggleESP),
+            ToggleSA   = tostring(Cfg.Keys.ToggleSA),
+            ToggleRB   = tostring(Cfg.Keys.ToggleRB),
+        },
+    })
+end
+
+local function ApplySaved(t)
+    if not t then return end
+    for _, k in ipairs({"ESPEnabled","SAEnabled","RBEnabled","MaxDistESP","MaxDistSA",
+                         "SARandomWeight","MaxDistRB","RBCooldown","RBTargetPart"}) do
+        if t[k] ~= nil then Cfg[k] = t[k] end
+    end
+    if t.Keys then
+        for _, k in ipairs({"ToggleMenu","ToggleESP","ToggleSA","ToggleRB"}) do
+            if t.Keys[k] then
+                local kc = Enum.KeyCode[t.Keys[k]:gsub("Enum%.KeyCode%.","")]
+                if kc then Cfg.Keys[k] = kc end
+            end
+        end
+    end
+end
+
+local function SaveConfig(name)
+    EnsureDir()
+    writefile(CONFIG_DIR .. "/" .. name .. ".json", SerializeCfg())
+end
+
+local function LoadConfig(name)
+    local path = CONFIG_DIR .. "/" .. name .. ".json"
+    if not isfile(path) then return false end
+    local ok, t = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
+    if ok and t then ApplySaved(t); return true end
+    return false
+end
+
+local function DeleteConfig(name)
+    local path = CONFIG_DIR .. "/" .. name .. ".json"
+    if isfile(path) then delfile(path) end
+end
+
+local function ListConfigs()
+    EnsureDir()
+    local out = {}
+    for _, f in ipairs(listfiles(CONFIG_DIR)) do
+        local n = f:match("([^/\\]+)%.json$")
+        if n then table.insert(out, n) end
+    end
+    return out
+end
+
+local function GetAutoload()
+    if isfile(AUTOLOAD_FILE) then return readfile(AUTOLOAD_FILE):match("^%s*(.-)%s*$") end
+    return nil
+end
+
+local function SetAutoload(name)
+    EnsureDir()
+    if name and name ~= "" then
+        writefile(AUTOLOAD_FILE, name)
+    else
+        if isfile(AUTOLOAD_FILE) then delfile(AUTOLOAD_FILE) end
+    end
+end
+
+do
+    local al = GetAutoload()
+    if al and al ~= "" then LoadConfig(al) end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 4. UI
+-- ─────────────────────────────────────────────────────────────────────────────
+do local old = CoreGui:FindFirstChild("ND_UI"); if old then old:Destroy() end end
+
+local Root = Instance.new("ScreenGui")
+Root.Name           = "ND_UI"
+Root.ResetOnSpawn   = false
+Root.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+Root.Parent         = CoreGui
+
+-- ── colour palette — navy-dark glass, red accent ───────────────────────────
+local C = {
+    bg          = Color3.fromRGB(8,   10,  16),
+    panel       = Color3.fromRGB(11,  14,  22),
+    surface     = Color3.fromRGB(16,  20,  32),
+    surfaceHov  = Color3.fromRGB(22,  18,  20),   -- slight red warmth on hover
+    border      = Color3.fromRGB(35,  42,  65),
+    borderHi    = Color3.fromRGB(110, 45,  55),   -- red-tinted highlight border
+    text        = Color3.fromRGB(215, 220, 235),
+    sub         = Color3.fromRGB(90,  100, 130),
+    accent      = Color3.fromRGB(220, 60,  60),   -- PRIMARY RED
+    accentDim   = Color3.fromRGB(90,  25,  30),   -- dim red
+    on          = Color3.fromRGB(220, 60,  60),   -- toggle ON = red
+    onBG        = Color3.fromRGB(60,  14,  18),   -- toggle ON background
+    off         = Color3.fromRGB(55,  62,  85),
+    offBG       = Color3.fromRGB(14,  16,  26),
+    danger      = Color3.fromRGB(220, 60,  60),
+    green       = Color3.fromRGB(60,  200, 100),
+}
+
+-- ── helpers ────────────────────────────────────────────────────────────────
+local function Corner(r, p)
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0,r); c.Parent = p; return c
+end
+local function Stroke(col, th, tr, p)
+    local s = Instance.new("UIStroke")
+    s.Color = col; s.Thickness = th; s.Transparency = tr
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; s.Parent = p; return s
+end
+local function Label(txt, sz, col, font, parent)
+    local l = Instance.new("TextLabel")
+    l.Text = txt; l.TextSize = sz; l.TextColor3 = col
+    l.Font = font or Enum.Font.Gotham
+    l.BackgroundTransparency = 1; l.RichText = true; l.Parent = parent
+    return l
+end
+local function Tween(obj, t, props)
+    TweenService:Create(obj, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+local function Pad(l,r,t,b,p)
+    local u = Instance.new("UIPadding")
+    u.PaddingLeft   = UDim.new(0,l); u.PaddingRight  = UDim.new(0,r)
+    u.PaddingTop    = UDim.new(0,t); u.PaddingBottom = UDim.new(0,b)
+    u.Parent = p; return u
+end
+local function VList(gap, p)
+    local l = Instance.new("UIListLayout")
+    l.FillDirection = Enum.FillDirection.Vertical
+    l.SortOrder     = Enum.SortOrder.LayoutOrder
+    l.Padding       = UDim.new(0,gap); l.Parent = p; return l
+end
+local function HList(gap, p)
+    local l = Instance.new("UIListLayout")
+    l.FillDirection = Enum.FillDirection.Horizontal
+    l.SortOrder     = Enum.SortOrder.LayoutOrder
+    l.Padding       = UDim.new(0,gap); l.Parent = p; return l
+end
+
+-- ── outer panel ────────────────────────────────────────────────────────────
+local PANEL_MIN_W = 300
+local PANEL_MIN_H = 380
+local HANDLE_SIZE = 14  -- invisible corner drag zone
+
+local Panel = Instance.new("Frame")
+Panel.Name                   = "Panel"
+Panel.Size                   = UDim2.new(0, 360, 0, 520)
+Panel.Position               = UDim2.new(0.5,-180, 0.5,-260)
+Panel.BackgroundColor3       = C.bg
+Panel.BackgroundTransparency = 0.06
+Panel.BorderSizePixel        = 0
+Panel.Visible                = true
+Panel.Parent                 = Root
+Corner(10, Panel)
+Stroke(C.border, 1, 0, Panel)
+
+-- subtle inner glow along top edge
+local TopGlow = Instance.new("Frame")
+TopGlow.Size              = UDim2.new(1,-2, 0, 1)
+TopGlow.Position          = UDim2.new(0,1, 0, 0)
+TopGlow.BackgroundColor3  = C.accentDim
+TopGlow.BackgroundTransparency = 0.2
+TopGlow.BorderSizePixel   = 0
+TopGlow.Parent            = Panel
+
+-- ── header ─────────────────────────────────────────────────────────────────
+local Header = Instance.new("Frame")
+Header.Name                  = "Header"
+Header.Size                  = UDim2.new(1, 0, 0, 44)
+Header.BackgroundColor3      = C.panel
+Header.BackgroundTransparency= 0
+Header.BorderSizePixel       = 0
+Header.Parent                = Panel
+Corner(10, Header)
+
+local HFix = Instance.new("Frame")
+HFix.Size = UDim2.new(1,0,0,10); HFix.Position = UDim2.new(0,0,1,-10)
+HFix.BackgroundColor3 = C.panel; HFix.BackgroundTransparency = 0
+HFix.BorderSizePixel  = 0; HFix.Parent = Header
+
+local HSep = Instance.new("Frame")
+HSep.Size = UDim2.new(1,0,0,1); HSep.Position = UDim2.new(0,0,1,-1)
+HSep.BackgroundColor3 = C.border; HSep.BorderSizePixel = 0; HSep.Parent = Header
+
+-- brand
+local BrandRow = Instance.new("Frame")
+BrandRow.Size = UDim2.new(1,-90,1,0); BrandRow.BackgroundTransparency = 1
+BrandRow.Parent = Header
+HList(6, BrandRow); Pad(14,0,0,0,BrandRow)
+
+local AccentBar = Instance.new("Frame")
+AccentBar.Size = UDim2.new(0,3,0,18); AccentBar.BackgroundColor3 = C.accent
+AccentBar.BorderSizePixel = 0; AccentBar.LayoutOrder = 1; AccentBar.Parent = BrandRow
+Corner(2, AccentBar)
+
+local BrandName = Label("Noah Developments", 13, C.text, Enum.Font.GothamBold, BrandRow)
+BrandName.Size = UDim2.new(0,200,1,0); BrandName.TextXAlignment = Enum.TextXAlignment.Left
+BrandName.LayoutOrder = 2
+
+local VerTag = Label("v2.0", 9, C.sub, Enum.Font.Gotham, BrandRow)
+VerTag.Size = UDim2.new(0,30,1,0); VerTag.TextXAlignment = Enum.TextXAlignment.Left
+VerTag.LayoutOrder = 3
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0,24,0,24); CloseBtn.Position = UDim2.new(1,-34,0.5,-12)
+CloseBtn.BackgroundColor3 = C.surface; CloseBtn.BackgroundTransparency = 0
+CloseBtn.BorderSizePixel  = 0; CloseBtn.Text = "×"
+CloseBtn.TextColor3 = C.sub; CloseBtn.TextSize = 16; CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.Parent = Header; Corner(5, CloseBtn)
+CloseBtn.MouseButton1Click:Connect(function() Panel.Visible = false end)
+CloseBtn.MouseEnter:Connect(function() Tween(CloseBtn,0.1,{BackgroundColor3=C.surfaceHov, TextColor3=C.danger}) end)
+CloseBtn.MouseLeave:Connect(function() Tween(CloseBtn,0.1,{BackgroundColor3=C.surface,    TextColor3=C.sub}) end)
+
+-- ── section header builder ─────────────────────────────────────────────────
+local function SectionHeader(page, title, order)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1,0,0,26); row.BackgroundTransparency = 1
+    row.LayoutOrder = order; row.Parent = page
+
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(0,2,0,14); bar.Position = UDim2.new(0,0,0.5,-7)
+    bar.BackgroundColor3 = C.accent; bar.BorderSizePixel = 0; bar.Parent = row
+    Corner(1, bar)
+
+    local lbl = Label(title, 11, C.accent, Enum.Font.GothamBold, row)
+    lbl.Size = UDim2.new(1,-10,1,0); lbl.Position = UDim2.new(0,10,0,0)
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    return row
+end
+
+-- ── scrolling content area ─────────────────────────────────────────────────
+local Scroll = Instance.new("ScrollingFrame")
+Scroll.Name                  = "Scroll"
+Scroll.Size                  = UDim2.new(1,0,1,-44)
+Scroll.Position              = UDim2.new(0,0,0,44)
+Scroll.BackgroundTransparency= 1
+Scroll.BorderSizePixel       = 0
+Scroll.ScrollBarThickness    = 3
+Scroll.ScrollBarImageColor3  = C.accentDim
+Scroll.AutomaticCanvasSize   = Enum.AutomaticSize.Y
+Scroll.CanvasSize            = UDim2.new(0,0,0,0)
+Scroll.Parent                = Panel
+VList(6, Scroll)
+Pad(14,14,10,14,Scroll)
+
+-- ── toggle row ─────────────────────────────────────────────────────────────
+local ToggleRefs = {}
+
+local function MakeToggle(labelTxt, subTxt, cfgKey, kbKey, order)
+    local row = Instance.new("Frame")
+    row.Size              = UDim2.new(1,0,0,54)
+    row.BackgroundColor3  = C.surface
+    row.BackgroundTransparency = 0
+    row.BorderSizePixel   = 0
+    row.LayoutOrder       = order
+    row.Parent            = Scroll
+    Corner(8, row)
+    Stroke(C.border,1,0,row)
+
+    local lbl = Label(labelTxt, 13, C.text, Enum.Font.Gotham, row)
+    lbl.Size = UDim2.new(0.55,0,0,18); lbl.Position = UDim2.new(0,12,0,10)
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local sub = Label(subTxt, 10, C.sub, Enum.Font.Gotham, row)
+    sub.Size = UDim2.new(0.55,0,0,14); sub.Position = UDim2.new(0,12,0,28)
+    sub.TextXAlignment = Enum.TextXAlignment.Left
+
+    -- keybind chip — click to rebind
+    local kb = Instance.new("TextButton")
+    kb.Size = UDim2.new(0,0,0,18); kb.AutomaticSize = Enum.AutomaticSize.X
+    kb.Position = UDim2.new(1,-98,0.5,-9)
+    kb.BackgroundColor3 = C.panel; kb.BackgroundTransparency = 0
+    kb.BorderSizePixel = 0; kb.TextSize = 10; kb.Font = Enum.Font.Gotham
+    kb.TextColor3 = C.sub
+    kb.Text = " " .. tostring(Cfg.Keys[kbKey]):gsub("Enum%.KeyCode%.","") .. " "
+    kb.Parent = row; Corner(4, kb); Stroke(C.border,1,0,kb)
+
+    local rebinding = false
+    kb.MouseButton1Click:Connect(function()
+        if rebinding then return end
+        rebinding = true
+        kb.Text = "  …  "; kb.TextColor3 = C.accent
+        local conn; conn = UserInputService.InputBegan:Connect(function(inp, gp)
+            if gp then return end
+            if inp.UserInputType == Enum.UserInputType.Keyboard then
+                Cfg.Keys[kbKey] = inp.KeyCode
+                kb.Text = " " .. tostring(inp.KeyCode):gsub("Enum%.KeyCode%.","") .. " "
+                kb.TextColor3 = C.sub
+                rebinding = false
+                conn:Disconnect()
+            end
+        end)
+    end)
+    kb.MouseEnter:Connect(function() if not rebinding then Tween(kb,0.08,{TextColor3=C.accent}) end end)
+    kb.MouseLeave:Connect(function() if not rebinding then Tween(kb,0.08,{TextColor3=C.sub}) end end)
+
+    -- pill toggle
+    local pillBG = Instance.new("Frame")
+    pillBG.Size = UDim2.new(0,44,0,24); pillBG.Position = UDim2.new(1,-54,0.5,-12)
+    pillBG.BackgroundColor3 = C.offBG; pillBG.BorderSizePixel = 0; pillBG.Parent = row
+    Corner(12, pillBG); Stroke(C.border,1,0,pillBG)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0,18,0,18); knob.Position = UDim2.new(0,3,0.5,-9)
+    knob.BackgroundColor3 = C.off; knob.BorderSizePixel = 0; knob.Parent = pillBG
+    Corner(9, knob)
+
+    local function SetVis(state)
+        Tween(knob,   0.15, {Position = state and UDim2.new(0,23,0.5,-9) or UDim2.new(0,3,0.5,-9),
+                              BackgroundColor3 = state and C.on or C.off})
+        Tween(pillBG, 0.15, {BackgroundColor3 = state and C.onBG or C.offBG})
+        Tween(row,    0.10, {BackgroundColor3 = state and C.surfaceHov or C.surface})
+    end
+    SetVis(Cfg[cfgKey])
+
+    local function DoToggle()
+        Cfg[cfgKey] = not Cfg[cfgKey]; SetVis(Cfg[cfgKey])
+    end
+
+    local hit = Instance.new("TextButton")
+    hit.Size = UDim2.new(1,-106,1,0); hit.BackgroundTransparency = 1; hit.Text = ""; hit.Parent = row
+    hit.MouseButton1Click:Connect(DoToggle)
+    pillBG.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then DoToggle() end
+    end)
+    row.MouseEnter:Connect(function() if not Cfg[cfgKey] then Tween(row,0.1,{BackgroundColor3=C.surfaceHov}) end end)
+    row.MouseLeave:Connect(function() if not Cfg[cfgKey] then Tween(row,0.1,{BackgroundColor3=C.surface}) end end)
+
+    ToggleRefs[cfgKey] = { setVis = SetVis, doToggle = DoToggle }
+end
+
+-- ── slider row ─────────────────────────────────────────────────────────────
+local function MakeSlider(labelTxt, cfgKey, minVal, maxVal, decimals, order)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1,0,0,52); row.BackgroundColor3 = C.surface
+    row.BackgroundTransparency = 0; row.BorderSizePixel = 0
+    row.LayoutOrder = order; row.Parent = Scroll
+    Corner(8, row); Stroke(C.border,1,0,row)
+
+    local lbl = Label(labelTxt, 12, C.text, Enum.Font.Gotham, row)
+    lbl.Size = UDim2.new(0.6,0,0,16); lbl.Position = UDim2.new(0,12,0,8)
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local fmt = decimals > 0 and ("%." .. decimals .. "f") or "%d"
+    local valLbl = Label(string.format(fmt, Cfg[cfgKey]), 11, C.accent, Enum.Font.GothamBold, row)
+    valLbl.Size = UDim2.new(0.4,-12,0,16); valLbl.Position = UDim2.new(0.6,0,0,8)
+    valLbl.TextXAlignment = Enum.TextXAlignment.Right
+
+    local track = Instance.new("Frame")
+    track.Size = UDim2.new(1,-24,0,4); track.Position = UDim2.new(0,12,0,34)
+    track.BackgroundColor3 = C.border; track.BorderSizePixel = 0; track.Parent = row
+    Corner(2, track)
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new((Cfg[cfgKey]-minVal)/(maxVal-minVal),0,1,0)
+    fill.BackgroundColor3 = C.accent; fill.BorderSizePixel = 0; fill.Parent = track
+    Corner(2, fill)
+
+    local thumb = Instance.new("Frame")
+    thumb.Size = UDim2.new(0,12,0,12); thumb.AnchorPoint = Vector2.new(0.5,0.5)
+    thumb.Position = UDim2.new((Cfg[cfgKey]-minVal)/(maxVal-minVal),0,0.5,0)
+    thumb.BackgroundColor3 = C.text; thumb.BorderSizePixel = 0; thumb.Parent = track
+    Corner(6, thumb)
+
+    local dragging = false
+    local function UpdateSlider(absX)
+        local tx = track.AbsolutePosition.X
+        local tw = track.AbsoluteSize.X
+        local t  = math.clamp((absX - tx) / tw, 0, 1)
+        local v  = minVal + t * (maxVal - minVal)
+        if decimals == 0 then v = math.round(v) end
+        Cfg[cfgKey] = v
+        fill.Size      = UDim2.new(t,0,1,0)
+        thumb.Position = UDim2.new(t,0,0.5,0)
+        valLbl.Text    = string.format(fmt, v)
+    end
+
+    track.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true; UpdateSlider(i.Position.X)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+            UpdateSlider(i.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+    end)
+end
+
+-- ── dropdown row ───────────────────────────────────────────────────────────
+local function MakeDropdown(labelTxt, cfgKey, options, order)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1,0,0,46); row.BackgroundColor3 = C.surface
+    row.BackgroundTransparency = 0; row.BorderSizePixel = 0
+    row.LayoutOrder = order; row.Parent = Scroll; row.ClipsDescendants = false
+    Corner(8, row); Stroke(C.border,1,0,row)
+
+    local lbl = Label(labelTxt, 12, C.text, Enum.Font.Gotham, row)
+    lbl.Size = UDim2.new(0.5,0,1,0); lbl.Position = UDim2.new(0,12,0,0)
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0,120,0,28); btn.Position = UDim2.new(1,-132,0.5,-14)
+    btn.BackgroundColor3 = C.panel; btn.BorderSizePixel = 0
+    btn.TextSize = 11; btn.Font = Enum.Font.Gotham; btn.TextColor3 = C.text
+    btn.Text = Cfg[cfgKey] .. "  ▾"; btn.Parent = row
+    Corner(6, btn); Stroke(C.border,1,0,btn)
+
+    local open = false
+    local listF = Instance.new("Frame")
+    listF.Size = UDim2.new(0,120,0,#options*28+4)
+    listF.Position = UDim2.new(1,-132,1,4)
+    listF.BackgroundColor3 = C.panel; listF.BorderSizePixel = 0
+    listF.Visible = false; listF.ZIndex = 10; listF.Parent = row
+    Corner(6, listF); Stroke(C.border,1,0,listF)
+    VList(1, listF); Pad(2,2,2,2,listF)
+
+    local function Pick(opt)
+        Cfg[cfgKey] = opt; btn.Text = opt .. "  ▾"
+        listF.Visible = false; open = false
+    end
+    for _, opt in ipairs(options) do
+        local ob = Instance.new("TextButton")
+        ob.Size = UDim2.new(1,0,0,26); ob.BackgroundColor3 = C.surface
+        ob.BackgroundTransparency = 0; ob.BorderSizePixel = 0
+        ob.TextSize = 11; ob.Font = Enum.Font.Gotham; ob.TextColor3 = C.sub
+        ob.Text = opt; ob.ZIndex = 11; ob.Parent = listF; Corner(4, ob)
+        ob.MouseButton1Click:Connect(function() Pick(opt) end)
+        ob.MouseEnter:Connect(function() Tween(ob,0.08,{BackgroundColor3=C.surfaceHov,TextColor3=C.text}) end)
+        ob.MouseLeave:Connect(function() Tween(ob,0.08,{BackgroundColor3=C.surface,   TextColor3=C.sub}) end)
+    end
+
+    btn.MouseButton1Click:Connect(function()
+        open = not open; listF.Visible = open
+    end)
+end
+
+-- ── populate content ───────────────────────────────────────────────────────
+SectionHeader(Scroll, "ESP", 1)
+MakeToggle("Chams", "Enemy highlights through walls", "ESPEnabled", "ToggleESP", 2)
+MakeSlider("Max Distance", "MaxDistESP", 100, 5000, 0, 3)
+
+SectionHeader(Scroll, "SILENT AIM", 10)
+MakeToggle("Silent Aim", "Redirect shots to nearest hitbox", "SAEnabled", "ToggleSA", 11)
+MakeSlider("Max Distance",  "MaxDistSA",      100, 2000, 0, 12)
+MakeSlider("Random Weight", "SARandomWeight",   0,    1, 2, 13)
+
+SectionHeader(Scroll, "RAGEBOT", 20)
+MakeToggle("Ragebot", "Auto-fires ShootGun at nearest target", "RBEnabled", "ToggleRB", 21)
+MakeSlider("Max Distance",  "MaxDistRB",  100, 2000, 0,  22)
+MakeSlider("Fire Cooldown", "RBCooldown", 0.05, 1.0, 2,  23)
+MakeDropdown("Target Part", "RBTargetPart",
+    {"Head","HumanoidRootPart","UpperTorso","LowerTorso","LeftArm","RightArm"}, 24)
+
+-- ── KEYBINDS SECTION ───────────────────────────────────────────────────────
+SectionHeader(Scroll, "KEYBINDS", 28)
+
+local KbPanel = Instance.new("Frame")
+KbPanel.Size = UDim2.new(1,0,0,0); KbPanel.AutomaticSize = Enum.AutomaticSize.Y
+KbPanel.BackgroundColor3 = C.surface; KbPanel.BackgroundTransparency = 0
+KbPanel.BorderSizePixel  = 0; KbPanel.LayoutOrder = 29; KbPanel.Parent = Scroll
+Corner(8, KbPanel); Stroke(C.border,1,0,KbPanel)
+VList(2, KbPanel); Pad(12,12,8,8,KbPanel)
+
+local KB_LABELS = {
+    { key = "ToggleMenu", label = "Toggle Menu" },
+    { key = "ToggleESP",  label = "Toggle ESP"  },
+    { key = "ToggleSA",   label = "Toggle Silent Aim" },
+    { key = "ToggleRB",   label = "Toggle Ragebot" },
+}
+
+local KbChipRefs = {}
+
+local function MakeKbRow(labelTxt, kbKey)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1,0,0,32); row.BackgroundTransparency = 1; row.Parent = KbPanel
+    HList(0, row)
+
+    local nameLbl = Label(labelTxt, 11, C.text, Enum.Font.Gotham, row)
+    nameLbl.Size = UDim2.new(1,-90,1,0); nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local chip = Instance.new("TextButton")
+    chip.Size = UDim2.new(0,82,0,22); chip.AnchorPoint = Vector2.new(1,0.5)
+    chip.Position = UDim2.new(1,0,0.5,0)
+    chip.BackgroundColor3 = C.panel; chip.BackgroundTransparency = 0
+    chip.BorderSizePixel = 0; chip.TextSize = 10; chip.Font = Enum.Font.Gotham
+    chip.TextColor3 = C.sub
+    chip.Text = " " .. tostring(Cfg.Keys[kbKey]):gsub("Enum%.KeyCode%.","") .. " "
+    chip.Parent = row; Corner(4, chip); Stroke(C.border,1,0,chip)
+
+    local rebinding = false
+    chip.MouseButton1Click:Connect(function()
+        if rebinding then return end
+        rebinding = true
+        chip.Text = "  …  "; chip.TextColor3 = C.accent
+        local conn; conn = UserInputService.InputBegan:Connect(function(inp, gp)
+            if gp then return end
+            if inp.UserInputType == Enum.UserInputType.Keyboard then
+                Cfg.Keys[kbKey] = inp.KeyCode
+                chip.Text = " " .. tostring(inp.KeyCode):gsub("Enum%.KeyCode%.","") .. " "
+                chip.TextColor3 = C.sub
+                rebinding = false
+                conn:Disconnect()
+                -- sync the inline chip on the toggle row if it exists
+                if KbChipRefs[kbKey] then
+                    KbChipRefs[kbKey].Text = chip.Text
+                end
+            end
+        end)
+    end)
+    chip.MouseEnter:Connect(function() if not rebinding then Tween(chip,0.08,{TextColor3=C.accent}) end end)
+    chip.MouseLeave:Connect(function() if not rebinding then Tween(chip,0.08,{TextColor3=C.sub}) end end)
+end
+
+for _, entry in ipairs(KB_LABELS) do
+    MakeKbRow(entry.label, entry.key)
+end
+
+-- CONFIGS SECTION
+SectionHeader(Scroll, "CONFIGS", 30)
+
+-- ── config panel ───────────────────────────────────────────────────────────
+local CfgPanel = Instance.new("Frame")
+CfgPanel.Size = UDim2.new(1,0,0,0); CfgPanel.AutomaticSize = Enum.AutomaticSize.Y
+CfgPanel.BackgroundColor3 = C.surface; CfgPanel.BackgroundTransparency = 0
+CfgPanel.BorderSizePixel  = 0; CfgPanel.LayoutOrder = 31; CfgPanel.Parent = Scroll
+Corner(8, CfgPanel); Stroke(C.border,1,0,CfgPanel)
+VList(6, CfgPanel); Pad(12,12,10,10,CfgPanel)
+
+local InputRow = Instance.new("Frame")
+InputRow.Size = UDim2.new(1,0,0,30); InputRow.BackgroundTransparency = 1
+InputRow.Parent = CfgPanel; HList(6, InputRow)
+
+local NameBox = Instance.new("TextBox")
+NameBox.Size = UDim2.new(1,-70,1,0); NameBox.BackgroundColor3 = C.panel
+NameBox.BackgroundTransparency = 0; NameBox.BorderSizePixel = 0
+NameBox.TextSize = 11; NameBox.Font = Enum.Font.Gotham
+NameBox.TextColor3 = C.text; NameBox.PlaceholderText = "config name..."
+NameBox.PlaceholderColor3 = C.sub; NameBox.Text = ""
+NameBox.ClearTextOnFocus = false; NameBox.Parent = InputRow
+Corner(6, NameBox); Stroke(C.border,1,0,NameBox); Pad(8,8,0,0,NameBox)
+
+local SaveBtn = Instance.new("TextButton")
+SaveBtn.Size = UDim2.new(0,62,1,0); SaveBtn.BackgroundColor3 = C.accentDim
+SaveBtn.BackgroundTransparency = 0; SaveBtn.BorderSizePixel = 0
+SaveBtn.TextSize = 11; SaveBtn.Font = Enum.Font.GothamBold
+SaveBtn.TextColor3 = C.accent; SaveBtn.Text = "Save"
+SaveBtn.Parent = InputRow; Corner(6, SaveBtn); Stroke(C.borderHi,1,0,SaveBtn)
+
+local StatusLbl = Label("", 10, C.sub, Enum.Font.Gotham, CfgPanel)
+StatusLbl.Size = UDim2.new(1,0,0,14); StatusLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+local ListCont = Instance.new("Frame")
+ListCont.Size = UDim2.new(1,0,0,0); ListCont.AutomaticSize = Enum.AutomaticSize.Y
+ListCont.BackgroundTransparency = 1; ListCont.Parent = CfgPanel
+VList(4, ListCont)
+
+local function Flash(txt, col)
+    StatusLbl.Text = txt; StatusLbl.TextColor3 = col or C.sub
+    task.delay(2.5, function() StatusLbl.Text = "" end)
+end
+
+local autoloadName = GetAutoload() or ""
+
+local function BuildConfigList()
+    for _, c in ipairs(ListCont:GetChildren()) do
+        if c:IsA("Frame") or c:IsA("TextLabel") then c:Destroy() end
+    end
+    local cfgs = ListConfigs()
+    if #cfgs == 0 then
+        local none = Label("No saved configs.", 10, C.sub, Enum.Font.Gotham, ListCont)
+        none.Size = UDim2.new(1,0,0,18); none.TextXAlignment = Enum.TextXAlignment.Left
+        return
+    end
+    for _, name in ipairs(cfgs) do
+        local isAL = (autoloadName == name)
+        local cRow = Instance.new("Frame")
+        cRow.Size = UDim2.new(1,0,0,30); cRow.BackgroundColor3 = isAL and C.onBG or C.panel
+        cRow.BackgroundTransparency = 0; cRow.BorderSizePixel = 0; cRow.Parent = ListCont
+        Corner(6, cRow); Stroke(isAL and C.accentDim or C.border,1,0,cRow)
+
+        local nLbl = Label(name, 11, isAL and C.accent or C.text, Enum.Font.Gotham, cRow)
+        nLbl.Size = UDim2.new(0.5,0,1,0); nLbl.Position = UDim2.new(0,10,0,0)
+        nLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+        local alTag = Label(isAL and "● autoload" or "", 9, C.accent, Enum.Font.Gotham, cRow)
+        alTag.Size = UDim2.new(0.25,0,1,0); alTag.Position = UDim2.new(0.38,0,0,0)
+        alTag.TextXAlignment = Enum.TextXAlignment.Left
+
+        local btnW = 46
+        local function SmallBtn(label2, col, xOff)
+            local b = Instance.new("TextButton")
+            b.Size = UDim2.new(0,btnW,0,20); b.Position = UDim2.new(1,xOff,0.5,-10)
+            b.BackgroundColor3 = C.surface; b.BackgroundTransparency = 0; b.BorderSizePixel = 0
+            b.TextSize = 10; b.Font = Enum.Font.Gotham; b.TextColor3 = col; b.Text = label2
+            b.Parent = cRow; Corner(4, b); Stroke(C.border,1,0,b)
+            b.MouseEnter:Connect(function() Tween(b,0.08,{BackgroundColor3=C.surfaceHov}) end)
+            b.MouseLeave:Connect(function() Tween(b,0.08,{BackgroundColor3=C.surface}) end)
+            return b
+        end
+
+        local loadB = SmallBtn("Load",                   C.text,   -(btnW*3+18))
+        local alB   = SmallBtn(isAL and "Unset" or "Auto", C.accent, -(btnW*2+12))
+        local delB  = SmallBtn("Del",                    C.danger, -(btnW+6))
+
+        loadB.MouseButton1Click:Connect(function()
+            if LoadConfig(name) then
+                for k, ref in pairs(ToggleRefs) do ref.setVis(Cfg[k]) end
+                Flash("Loaded: " .. name, C.green)
+            end
+        end)
+        alB.MouseButton1Click:Connect(function()
+            if autoloadName == name then
+                autoloadName = ""; SetAutoload(nil)
+            else
+                autoloadName = name; SetAutoload(name)
+            end
+            BuildConfigList()
+        end)
+        delB.MouseButton1Click:Connect(function()
+            DeleteConfig(name)
+            if autoloadName == name then autoloadName = ""; SetAutoload(nil) end
+            Flash("Deleted: " .. name, C.danger)
+            BuildConfigList()
+        end)
+    end
+end
+
+SaveBtn.MouseButton1Click:Connect(function()
+    local n = NameBox.Text:match("^%s*(.-)%s*$")
+    if n == "" then Flash("Enter a name first.", C.danger); return end
+    SaveConfig(n); NameBox.Text = ""; Flash("Saved: " .. n, C.green)
+    BuildConfigList()
+end)
+
+BuildConfigList()
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- DRAG (header)
+-- ─────────────────────────────────────────────────────────────────────────────
+do
+    local drag, ds, sp = false, nil, nil
+    Header.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            drag = true; ds = i.Position; sp = Panel.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if drag and i.UserInputType == Enum.UserInputType.MouseMovement then
+            local d = i.Position - ds
+            Panel.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then drag = false end
+    end)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CORNER RESIZE HANDLES
+-- ─────────────────────────────────────────────────────────────────────────────
+do
+    -- Four corners: TL / TR / BL / BR
+    -- Each handle is a transparent 14×14 zone; dragging adjusts Panel size + position.
+    local corners = {
+        { name = "TL", anchorX = 0,   anchorY = 0,   posX = 0,  posY = 0  },
+        { name = "TR", anchorX = 1,   anchorY = 0,   posX = 1,  posY = 0  },
+        { name = "BL", anchorX = 0,   anchorY = 1,   posX = 0,  posY = 1  },
+        { name = "BR", anchorX = 1,   anchorY = 1,   posX = 1,  posY = 1  },
+    }
+
+    for _, def in ipairs(corners) do
+        local handle = Instance.new("Frame")
+        handle.Name                  = "Resize_" .. def.name
+        handle.Size                  = UDim2.new(0, HANDLE_SIZE, 0, HANDLE_SIZE)
+        handle.AnchorPoint           = Vector2.new(def.anchorX, def.anchorY)
+        handle.Position              = UDim2.new(def.posX, 0, def.posY, 0)
+        handle.BackgroundTransparency= 1
+        handle.ZIndex                = 20
+        handle.Parent                = Panel
+
+        local resizing   = false
+        local startMouse = nil
+        local startSize  = nil
+        local startPos   = nil
+
+        handle.InputBegan:Connect(function(i)
+            if i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+            resizing   = true
+            startMouse = Vector2.new(i.Position.X, i.Position.Y)
+            startSize  = Vector2.new(Panel.AbsoluteSize.X, Panel.AbsoluteSize.Y)
+            startPos   = Vector2.new(Panel.AbsolutePosition.X, Panel.AbsolutePosition.Y)
+        end)
+
+        UserInputService.InputChanged:Connect(function(i)
+            if not resizing then return end
+            if i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+
+            local dx = i.Position.X - startMouse.X
+            local dy = i.Position.Y - startMouse.Y
+
+            local newW = startSize.X
+            local newH = startSize.Y
+            local newX = startPos.X
+            local newY = startPos.Y
+
+            -- horizontal
+            if def.anchorX == 0 then
+                -- left edge: move left edge right/left
+                newW = math.max(PANEL_MIN_W, startSize.X - dx)
+                newX = startPos.X + (startSize.X - newW)
+            else
+                -- right edge: extend right
+                newW = math.max(PANEL_MIN_W, startSize.X + dx)
+            end
+
+            -- vertical
+            if def.anchorY == 0 then
+                -- top edge: move top edge
+                newH = math.max(PANEL_MIN_H, startSize.Y - dy)
+                newY = startPos.Y + (startSize.Y - newH)
+            else
+                -- bottom edge: extend down
+                newH = math.max(PANEL_MIN_H, startSize.Y + dy)
+            end
+
+            Panel.Size     = UDim2.new(0, newW, 0, newH)
+            Panel.Position = UDim2.new(0, newX, 0, newY)
+        end)
+
+        UserInputService.InputEnded:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 then
+                resizing = false
+            end
+        end)
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 5. ESP — CHAMS ONLY
+-- ─────────────────────────────────────────────────────────────────────────────
+local ChamsFolder = Instance.new("Folder")
+ChamsFolder.Name = "ND_Chams"; ChamsFolder.Parent = CoreGui
+
+local function InjectChams(player)
+    local function Apply(char)
+        if not char then return end
+        local tag = "nd_" .. player.UserId
+        local h   = ChamsFolder:FindFirstChild(tag)
+        if not h then h = Instance.new("Highlight"); h.Name = tag; h.Parent = ChamsFolder end
+        h.Adornee = char; h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        h.FillColor = Cfg.ChamsFill; h.OutlineColor = Cfg.ChamsOutline
+        h.FillTransparency = Cfg.ChamsFillAlpha; h.OutlineTransparency = Cfg.ChamsOutAlpha
+        h.Enabled = false
+    end
+    player.CharacterAdded:Connect(Apply)
+    if player.Character then Apply(player.Character) end
+end
+
+local function RemoveChams(player)
+    local h = ChamsFolder:FindFirstChild("nd_" .. player.UserId)
+    if h then h:Destroy() end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do if p ~= LP then InjectChams(p) end end
+Players.PlayerAdded:Connect(function(p) if p ~= LP then InjectChams(p) end end)
+Players.PlayerRemoving:Connect(RemoveChams)
+
+RunService.RenderStepped:Connect(function()
+    local lc = LP.Character
+    local lr = lc and lc:FindFirstChild("HumanoidRootPart")
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == LP then continue end
+        local h = ChamsFolder:FindFirstChild("nd_" .. p.UserId)
+        if not h then InjectChams(p); h = ChamsFolder:FindFirstChild("nd_" .. p.UserId) end
+        if not h then continue end
+        if Cfg.ESPEnabled and p.Character and lr then
+            local rp  = p.Character:FindFirstChild("HumanoidRootPart")
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            local d   = rp and (rp.Position - lr.Position).Magnitude
+            h.FillColor = Cfg.ChamsFill; h.OutlineColor = Cfg.ChamsOutline
+            h.FillTransparency = Cfg.ChamsFillAlpha; h.OutlineTransparency = Cfg.ChamsOutAlpha
+            h.Enabled = hum and hum.Health > 0 and d ~= nil and d <= Cfg.MaxDistESP
+        else
+            h.Enabled = false
+        end
+    end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 6. SILENT AIM
+-- ─────────────────────────────────────────────────────────────────────────────
+local function SAFilter(filterList, ignoreChar)
+    local f = filterList and {table.unpack(filterList)} or {}
+    local function addChar(char)
+        if not char then return end
+        for _, v in ipairs(char:GetDescendants()) do
+            if v:IsA("BasePart") then table.insert(f, v) end
+        end
+    end
+    addChar(LP.Character); addChar(ignoreChar)
+    return f
+end
+
+local function SurfacePoints(part)
+    local cf = part.CFrame; local s = part.Size
+    local hx, hy = s.X/2, s.Y/2
+    local pts = {
+        Vector3.new(0,0,0), Vector3.new(hx,hy,0), Vector3.new(-hx,hy,0),
+        Vector3.new(hx,-hy,0), Vector3.new(-hx,-hy,0),
+        Vector3.new(0,hy,0), Vector3.new(0,-hy,0),
+        Vector3.new(hx,0,0), Vector3.new(-hx,0,0),
+    }
+    local out = {}
+    for _, lp in ipairs(pts) do table.insert(out, cf:PointToWorldSpace(lp)) end
+    return out
+end
+
+local function VisiblePoint(part, origin, filter)
+    local p = RaycastParams.new()
+    p.FilterType = Enum.RaycastFilterType.Exclude
+    p.FilterDescendantsInstances = filter
+    for _, pt in ipairs(SurfacePoints(part)) do
+        local r = workspace:Raycast(origin, pt - origin, p)
+        if not r or r.Instance:IsDescendantOf(part.Parent) then return pt end
+    end
+    return nil
+end
+
+local function SAGetTarget(filterList, ignoreChar)
+    local origin   = Camera.CFrame.Position
+    local mousePos = UserInputService:GetMouseLocation()
+    local filter   = SAFilter(filterList, ignoreChar)
+    local visible  = {}
+
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl == LP then continue end
+        local char = pl.Character; if not char then continue end
+        local hum  = char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then continue end
+        local pParts = {}
+        for _, part in ipairs(char:GetDescendants()) do
+            if not part:IsA("BasePart") then continue end
+            if (part.Position - origin).Magnitude > Cfg.MaxDistSA then continue end
+            local sp, onScreen = Camera:WorldToViewportPoint(part.Position)
+            if not onScreen then continue end
+            local vp = VisiblePoint(part, origin, filter)
+            if not vp then continue end
+            local sd = (Vector2.new(sp.X,sp.Y) - mousePos).Magnitude
+            table.insert(pParts, {part=part, hitPoint=vp, sd=sd})
+        end
+        if #pParts == 0 then continue end
+        table.sort(pParts, function(a,b) return a.sd < b.sd end)
+        if #pParts == 1 then
+            table.insert(visible, pParts[1])
+        else
+            local tot, wts = 0, {}
+            for _, e in ipairs(pParts) do
+                local w = 1/math.max(e.sd^Cfg.SARandomWeight, 0.001)
+                table.insert(wts, w); tot = tot + w
+            end
+            local roll, cum = math.random()*tot, 0
+            for i, e in ipairs(pParts) do
+                cum = cum + wts[i]
+                if roll <= cum then table.insert(visible, e); break end
+            end
+        end
+    end
+    if #visible == 0 then return nil, nil end
+    table.sort(visible, function(a,b) return a.sd < b.sd end)
+    local picked = visible[1]
+    return picked.part, picked.hitPoint
+end
+
+local ok, WRC = pcall(function() return require(ReplicatedStorage.Modules.WeaponRaycast) end)
+if ok and WRC then
+    local mt = getrawmetatable(WRC); setreadonly(mt, false)
+    local orig = mt.__call
+    mt.__call = newcclosure(function(self, origin, endpoint, ignoreChar, colGroup, filterList)
+        local tool   = LP.Character and LP.Character:FindFirstChildOfClass("Tool")
+        local isGun  = tool
+            and tool:FindFirstChild("Fire")   and tool.Fire:IsA("Sound")
+            and tool:FindFirstChild("Reload") and tool.Reload:IsA("Sound")
+        if not Cfg.SAEnabled or not isGun then
+            return orig(self, origin, endpoint, ignoreChar, colGroup, filterList)
+        end
+        local target, hitPt = SAGetTarget(filterList, ignoreChar)
+        if not target or not hitPt then
+            return orig(self, origin, endpoint, ignoreChar, colGroup, filterList)
+        end
+        local rp = RaycastParams.new()
+        rp.FilterType = Enum.RaycastFilterType.Exclude
+        rp.FilterDescendantsInstances = SAFilter(filterList, ignoreChar)
+        if colGroup then rp.CollisionGroup = colGroup end
+        local confirm = workspace:Raycast(origin, hitPt - origin, rp)
+        if not confirm or confirm.Instance:IsDescendantOf(target.Parent) then
+            return {
+                Position = hitPt + Cfg.SAHitOffset,
+                Instance = target,
+                Normal   = (origin - hitPt).Unit,
+                Material = Enum.Material.SmoothPlastic,
+            }
+        end
+        return orig(self, origin, endpoint, ignoreChar, colGroup, filterList)
+    end)
+    setreadonly(mt, true)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 7. RAGEBOT
+-- ─────────────────────────────────────────────────────────────────────────────
+local ShootGun = ReplicatedStorage:FindFirstChild("Remotes")
+    and ReplicatedStorage.Remotes:FindFirstChild("ShootGun")
+
+local function RBOrigin()
+    local c = LP.Character
+    local h = c and c:FindFirstChild("Head")
+    return h and h.Position
+        or (Camera and Camera.CFrame.Position)
+        or (c and c:FindFirstChild("HumanoidRootPart") and c.HumanoidRootPart.Position)
+        or Vector3.zero
+end
+
+local function RBTarget()
+    local c = LP.Character
+    local r = c and c:FindFirstChild("HumanoidRootPart"); if not r then return nil end
+    local bp, bd
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl == LP or not pl.Character then continue end
+        local hum  = pl.Character:FindFirstChildOfClass("Humanoid")
+        local part = pl.Character:FindFirstChild(Cfg.RBTargetPart)
+                  or pl.Character:FindFirstChild("HumanoidRootPart")
+        if not hum or not part then continue end
+        if hum.Health <= 0 or hum:GetState() == Enum.HumanoidStateType.Dead then continue end
+        local d = (part.Position - r.Position).Magnitude
+        if d <= Cfg.MaxDistRB and (not bd or d < bd) then bp, bd = part, d end
+    end
+    if bp then return bp, bp.Position end
+    return nil
+end
+
+local lastFire = 0
+RunService.Heartbeat:Connect(function()
+    if not Cfg.RBEnabled or not ShootGun then return end
+    local now = os.clock()
+    if now - lastFire < Cfg.RBCooldown then return end
+    local part, pos = RBTarget()
+    if part and pos then lastFire = now; ShootGun:FireServer(RBOrigin(), pos, part, pos) end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 8. KEYBIND LISTENER
+-- ─────────────────────────────────────────────────────────────────────────────
+local function Notif(title, body)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {Title=title, Text=body, Duration=2})
+    end)
+end
+
+UserInputService.InputBegan:Connect(function(inp, gp)
+    if gp or inp.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    local k = inp.KeyCode
+    if k == Cfg.Keys.ToggleMenu then
+        Panel.Visible = not Panel.Visible
+    elseif k == Cfg.Keys.ToggleESP then
+        Cfg.ESPEnabled = not Cfg.ESPEnabled
+        if ToggleRefs.ESPEnabled then ToggleRefs.ESPEnabled.setVis(Cfg.ESPEnabled) end
+        Notif("ESP", Cfg.ESPEnabled and "on" or "off")
+    elseif k == Cfg.Keys.ToggleSA then
+        Cfg.SAEnabled = not Cfg.SAEnabled
+        if ToggleRefs.SAEnabled then ToggleRefs.SAEnabled.setVis(Cfg.SAEnabled) end
+        Notif("Silent Aim", Cfg.SAEnabled and "on" or "off")
+    elseif k == Cfg.Keys.ToggleRB then
+        Cfg.RBEnabled = not Cfg.RBEnabled
+        if ToggleRefs.RBEnabled then ToggleRefs.RBEnabled.setVis(Cfg.RBEnabled) end
+        Notif("Ragebot", Cfg.RBEnabled and "on" or "off")
+    end
+end)
